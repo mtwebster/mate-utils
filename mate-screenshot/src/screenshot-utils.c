@@ -446,29 +446,6 @@ out:
   g_timeout_add (200, emit_select_callback_in_idle, cb_data);
 }
 
-static Window
-find_wm_window (Window xid)
-{
-  Window root, parent, *children;
-  unsigned int nchildren;
-
-  do
-    {
-      if (XQueryTree (GDK_DISPLAY_XDISPLAY (gdk_display_get_default ()), xid, &root,
-		      &parent, &children, &nchildren) == 0)
-	{
-	  g_warning ("Couldn't find window manager window");
-	  return None;
-	}
-
-      if (root == parent)
-	return xid;
-
-      xid = parent;
-    }
-  while (TRUE);
-}
-
 static cairo_region_t *
 make_region_with_monitors (GdkScreen *screen)
 {
@@ -596,6 +573,73 @@ mask_monitors (GdkPixbuf *pixbuf, GdkWindow *root_window)
   cairo_region_destroy (invisible_region);
 }
 
+static gboolean
+get_gtk_frame_extents (GdkWindow *window,
+                       gint       scale,
+                       GtkBorder *extents)
+{
+  GdkDisplay *display;
+  Display *xdisplay;
+  Window xwindow;
+  Atom returned_type;
+  int returned_format;
+  gulong n_items, bytes_after;
+  guchar *property;
+
+  returned_type = None;
+  returned_format = 0;
+  n_items = bytes_after = 0;
+
+  display = gdk_display_get_default ();
+  xwindow = GDK_WINDOW_XID (window);
+  xdisplay = GDK_DISPLAY_XDISPLAY (display);
+
+  gdk_x11_display_error_trap_push (display);
+
+  if (XGetWindowProperty (xdisplay, xwindow,
+                          gdk_x11_get_xatom_by_name ("_GTK_FRAME_EXTENTS"),
+                          0, G_MAXLONG, False, XA_CARDINAL,
+                          &returned_type,
+                          &returned_format,
+                          &n_items,
+                          &bytes_after,
+                          &property) != Success || returned_type == None)
+    {
+      if (property)
+        {
+          XFree (property);
+        }
+
+      gdk_x11_display_error_trap_pop_ignored (display);
+
+      return FALSE;
+    }
+
+  if (gdk_x11_display_error_trap_pop (display) != Success ||
+      returned_format != 32 ||
+      returned_type != XA_CARDINAL ||
+      n_items != 4)
+    {
+      if (property)
+        {
+          XFree (property);
+        }
+
+      return FALSE;
+    }
+
+  gulong *borders = (gulong *) property;
+
+  extents->left   = (int)borders[0] / scale;
+  extents->right  = (int)borders[1] / scale;
+  extents->top    = (int)borders[2] / scale;
+  extents->bottom = (int)borders[3] / scale;
+
+  XFree (property);
+
+  return TRUE;
+}
+
 GdkPixbuf *
 screenshot_get_pixbuf (GdkWindow    *window,
                        GdkRectangle *rectangle,
@@ -608,21 +652,8 @@ screenshot_get_pixbuf (GdkWindow    *window,
   gint x_real_orig, y_real_orig, x_orig, y_orig;
   gint width, real_width, height, real_height;
   gint screen_width, screen_height, scale;
-
-  /* If the screenshot should include the border, we look for the WM window. */
-
-  if (include_border)
-    {
-      Window xid, wm;
-
-      xid = GDK_WINDOW_XID (window);
-      wm = find_wm_window (xid);
-
-      if (wm != None)
-        window = gdk_x11_window_foreign_new_for_display (gdk_display_get_default (), wm);
-
-      /* fallback to no border if we can't find the WM window. */
-    }
+  GtkBorder frame_extents = { 0, 0, 0, 0 };
+  gboolean has_frame_extents = FALSE;
 
   root = gdk_get_default_root_window ();
   scale = gdk_window_get_scale_factor (root);
@@ -635,10 +666,40 @@ screenshot_get_pixbuf (GdkWindow    *window,
 
   gdk_window_get_origin (window, &x_real_orig, &y_real_orig);
 
-  x_orig = x_real_orig;
-  y_orig = y_real_orig;
-  width  = real_width;
-  height = real_height;
+  if (!get_gtk_frame_extents (window, scale, &frame_extents))
+    {
+      if (include_border)
+        {
+          GdkRectangle frame_rect;
+
+          gdk_window_get_frame_extents (window, &frame_rect);
+    
+          frame_extents.left = x_real_orig - frame_rect.x;
+          frame_extents.top = y_real_orig - frame_rect.y;
+          frame_extents.right = (frame_rect.x + frame_rect.width) - (x_real_orig + real_width);
+          frame_extents.bottom = (frame_rect.y + frame_rect.height) - (y_real_orig + real_height);
+
+          x_orig = frame_rect.x;
+          y_orig = frame_rect.y;
+          width = frame_rect.width;
+          height = frame_rect.height;
+        }
+      else
+        {
+          x_orig = x_real_orig;
+          y_orig = y_real_orig;
+          width  = real_width;
+          height = real_height;
+        }
+    }
+  else
+    {
+      has_frame_extents = TRUE;
+      x_orig = x_real_orig + frame_extents.left;
+      y_orig = y_real_orig + frame_extents.top;
+      width = real_width - (frame_extents.left + frame_extents.right);
+      height = real_height - (frame_extents.top + frame_extents.bottom);
+    }
 
   if (x_orig < 0)
     {
@@ -715,6 +776,17 @@ screenshot_get_pixbuf (GdkWindow    *window,
               rec_y = rectangles[i].y;
               rec_width = rectangles[i].width / scale;
               rec_height = rectangles[i].height / scale;
+
+              if (has_frame_extents)
+                {
+                  rec_width -= (frame_extents.left + frame_extents.right);
+                  rec_height -= (frame_extents.top + frame_extents.bottom);
+                }
+              else
+                {
+                  rec_width += (frame_extents.left + frame_extents.right);
+                  rec_height += (frame_extents.top + frame_extents.bottom);
+                }
 
               if (x_real_orig < 0)
                 {
